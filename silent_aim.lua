@@ -426,11 +426,23 @@ for k, v in next, getfenv(anon) do
                 return old(...);
             end)));
         elseif n == "bulletMagnetism" then
-            -- Native magnetism returns a BasePart (or nil). Returning a
-            -- Vector3 from this confused the game's downstream logic and
-            -- caused it to fall back to its own aim path at range. Hard-nil
-            -- it so Crosshair is the only voice in the room.
-            hookfunction(rawget(getfenv(anon), k), newcclosure(function() return nil; end));
+            -- v6: this is the actual silent-aim hammer. Native magnetism
+            -- returns the BasePart the bullet "hit"; whatever we return
+            -- here is what the engine registers a hit on, regardless of
+            -- where the bullet's path actually went. Returning getTarget()
+            -- means every fire that has a target in FOV magnetises onto
+            -- that target's head — no flight-time prediction needed, no
+            -- range falloff, no lead math.
+            --
+            -- The Crosshair hook above stays for cosmetics (visible bullet
+            -- trail still points at the target so spectators don't see a
+            -- wild straight-line shot). But the HIT comes from this return.
+            --
+            -- Returning a Vector3 here used to break things — the engine
+            -- expected a Part. A Part is what we give it.
+            hookfunction(rawget(getfenv(anon), k), newcclosure(function()
+                return getTarget();
+            end));
         end;
     end;
 end;
@@ -582,4 +594,4 @@ plr.CharacterAdded:Connect(function()
     tool = nil;
 end);
 
-SG["success"]("Silent aim v5.1 loaded — accel-aware lead + hit/miss detector with widened correlation window. F9 shows [yepper HIT] and [yepper MISS] lines.");
+SG["success"]("Silent aim v6 loaded — magnetism-driven hits (no flight-time, no range limit). F9 shows [yepper HIT] / [yepper MISS] for diagnostics.");
