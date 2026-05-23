@@ -426,23 +426,20 @@ for k, v in next, getfenv(anon) do
                 return old(...);
             end)));
         elseif n == "bulletMagnetism" then
-            -- v6: this is the actual silent-aim hammer. Native magnetism
-            -- returns the BasePart the bullet "hit"; whatever we return
-            -- here is what the engine registers a hit on, regardless of
-            -- where the bullet's path actually went. Returning getTarget()
-            -- means every fire that has a target in FOV magnetises onto
-            -- that target's head — no flight-time prediction needed, no
-            -- range falloff, no lead math.
+            -- v6 tried returning getTarget() (a BasePart) here so the
+            -- engine would register a hit on that part directly. It
+            -- crashed: WeaponModule:1594 does "magnetism_return - vec3",
+            -- which fails with "arithmetic (sub) on Instance and Vector3"
+            -- the moment a Part is returned. The native return type is a
+            -- Vector3, not a Part, and the subtraction is how the engine
+            -- derives bullet direction.
             --
-            -- The Crosshair hook above stays for cosmetics (visible bullet
-            -- trail still points at the target so spectators don't see a
-            -- wild straight-line shot). But the HIT comes from this return.
-            --
-            -- Returning a Vector3 here used to break things — the engine
-            -- expected a Part. A Part is what we give it.
-            hookfunction(rawget(getfenv(anon), k), newcclosure(function()
-                return getTarget();
-            end));
+            -- v6.1: revert to hard-nil. Crosshair-driven lead prediction
+            -- already gives sub-stud aim; the magnetism shortcut isn't
+            -- usable in this WeaponModule without knowing the exact
+            -- semantics of the Vector3 it expects (returning a head
+            -- position broke things at range in earlier experiments).
+            hookfunction(rawget(getfenv(anon), k), newcclosure(function() return nil; end));
         end;
     end;
 end;
@@ -594,4 +591,4 @@ plr.CharacterAdded:Connect(function()
     tool = nil;
 end);
 
-SG["success"]("Silent aim v6 loaded — magnetism-driven hits (no flight-time, no range limit). F9 shows [yepper HIT] / [yepper MISS] for diagnostics.");
+SG["success"]("Silent aim v6.1 loaded — accel-aware lead + hit/miss detector. v6's magnetism shortcut crashed shootEffect; reverted. F9 shows [yepper HIT] / [yepper MISS].");
