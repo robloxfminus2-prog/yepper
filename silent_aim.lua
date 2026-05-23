@@ -233,10 +233,15 @@ RunService.RenderStepped:Connect(function()
     end;
 end);
 
---==[ Bullet impact tracer (v3) ]==--
--- Hooks CosmeticProjectiles. Every time a bullet WE fired finishes its flight
--- (parent destroyed), pins a cyan ball at the last known position and prints
--- the distance from that point to the prediction we returned for that shot.
+--==[ Hit verification (v4) ]==--
+-- Two signals now:
+--   1. Cosmetic tracer (cyan ball) — kept for trajectory eyeballing. The LOG
+--      is gated so it only prints when the cosmetic dies NEAR an enemy body.
+--      Filters out cosmetics that punch into walls/skybox tens of studs past
+--      the target (which was making v3's deltas look catastrophic).
+--   2. Authoritative hit detector — listens to every enemy Humanoid for
+--      health drops within SHOT_WINDOW of OUR Shoot call. Ground truth.
+--      (Implemented below the Crosshair hook so it can use lastPrediction.)
 local impactMarker = Instance.new("Part");
 impactMarker.Name = "_aimImpact";
 impactMarker.Size = Vector3.new(0.75, 0.75, 0.75);
@@ -266,6 +271,28 @@ local function findFirstBasePart(inst: Instance): BasePart?
     return inst:FindFirstChildWhichIsA("BasePart", true);
 end;
 
+-- Returns the closest enemy body part to a world point, the distance to it,
+-- and which player it belongs to. Used both for the cosmetic-log gate and for
+-- correlating Humanoid.HealthChanged events back to the shot that caused them.
+local function nearestEnemyPart(point: Vector3): (BasePart?, number, Player?)
+    local bestPart, bestDist, bestPlr = nil, math.huge, nil;
+    for _, p in next, Players:GetPlayers() do
+        if p == plr or p.Team == plr.Team then continue; end;
+        local char = p.Character;
+        if not char then continue; end;
+        for _, body in ipairs({"Head","HumanoidRootPart","UpperTorso","LowerTorso","Torso"}) do
+            local part = char:FindFirstChild(body);
+            if part and part:IsA("BasePart") then
+                local d = (part.Position - point).Magnitude;
+                if d < bestDist then
+                    bestPart, bestDist, bestPlr = part, d, p;
+                end;
+            end;
+        end;
+    end;
+    return bestPart, bestDist, bestPlr;
+end;
+
 cp.ChildAdded:Connect(function(proj)
     -- only track projectiles that spawned right after WE pulled the trigger.
     -- (Crosshair fires every render frame for UI, so we can't gate on prediction
@@ -292,11 +319,16 @@ cp.ChildAdded:Connect(function(proj)
             impactMarker.CFrame = CFrame.new(lastPos);
             lastImpactAt = os.clock();
 
-            if predictionAtFire then
+            -- LOG GATE: only print if the cosmetic actually died near a body.
+            -- Otherwise it's a tracer that flew into a wall behind the target,
+            -- which produces huge single-axis deltas that look like big misses
+            -- but are really just the cosmetic continuing past the impact.
+            local enemyPart, enemyDist, enemyPlr = nearestEnemyPart(lastPos);
+            if enemyPart and enemyDist < 8 and predictionAtFire then
                 local d = lastPos - predictionAtFire;
                 print(string.format(
-                    "[yepper] impact %.2f studs from prediction  (dx=%.2f dy=%.2f dz=%.2f)",
-                    d.Magnitude, d.X, d.Y, d.Z
+                    "[yepper cosmetic] near %s (%.2f studs)  pred-delta %.2f  (dx=%.2f dy=%.2f dz=%.2f)",
+                    enemyPlr.Name, enemyDist, d.Magnitude, d.X, d.Y, d.Z
                 ));
             end;
         end;
@@ -366,11 +398,79 @@ for k, v in next, getfenv(anon) do
     end;
 end;
 
---==[ Shoot hook — sets lastFireAt so the impact tracer only logs OUR shots ]==--
+--==[ Shoot hook + authoritative hit detector ]==--
+-- The Shoot hook now ALSO snapshots, at the moment of fire, the prediction
+-- and the head position of whichever enemy was closest to that prediction.
+-- When that enemy's Humanoid loses health within SHOT_WINDOW, we know the
+-- shot connected and can compute the real prediction error against where the
+-- head WAS at fire time (not where it is by the time HealthChanged arrives,
+-- which can be 50-200ms later).
+local shotHistory: {{t: number, pred: Vector3, targetHead: Vector3?, targetName: string?}} = {};
+local SHOT_WINDOW = 0.30;
+
 local oldShoot; oldShoot = clonefunction(hookfunction(rawget(wm, "Shoot"), newcclosure(function(...)
     lastFireAt = os.clock();
+
+    local pred = lastPrediction;
+    if pred then
+        local _, _, who = nearestEnemyPart(pred);
+        local headPos = nil;
+        if who and who.Character and who.Character:FindFirstChild("Head") then
+            headPos = who.Character.Head.Position;
+        end;
+        table.insert(shotHistory, {
+            t = os.clock(),
+            pred = pred,
+            targetHead = headPos,
+            targetName = who and who.Name or nil,
+        });
+        while #shotHistory > 0 and (os.clock() - shotHistory[1].t) > 1 do
+            table.remove(shotHistory, 1);
+        end;
+    end;
+
     return oldShoot(...);
 end)));
+
+local function hookEnemyHumanoid(p: Player, char: Model)
+    if p == plr then return; end;
+    local hum = char:WaitForChild("Humanoid", 5);
+    if not hum then return; end;
+    local lastHP = hum.Health;
+    hum.HealthChanged:Connect(function(newHP)
+        local dmg = lastHP - newHP;
+        lastHP = newHP;
+        if dmg <= 0 then return; end;
+
+        local now = os.clock();
+        for i = #shotHistory, 1, -1 do
+            local s = shotHistory[i];
+            if (now - s.t) > SHOT_WINDOW then break; end;
+            if s.targetName == p.Name and s.targetHead then
+                local err = (s.pred - s.targetHead).Magnitude;
+                print(string.format(
+                    "[yepper HIT] %s took %.1f dmg  pred-error %.2f studs from head-at-fire  latency %.0fms",
+                    p.Name, dmg, err, (now - s.t) * 1000
+                ));
+                table.remove(shotHistory, i);
+                return;
+            end;
+        end;
+        -- damage on enemy with no matching shot — could be teammate fire,
+        -- world damage, or our prediction was way off the head we tracked.
+    end);
+end;
+
+for _, p in next, Players:GetPlayers() do
+    if p ~= plr then
+        if p.Character then hookEnemyHumanoid(p, p.Character); end;
+        p.CharacterAdded:Connect(function(c) hookEnemyHumanoid(p, c); end);
+    end;
+end;
+Players.PlayerAdded:Connect(function(p)
+    if p == plr then return; end;
+    p.CharacterAdded:Connect(function(c) hookEnemyHumanoid(p, c); end);
+end);
 
 --==[ Equip hook ]==--
 local t: thread;
@@ -413,4 +513,4 @@ plr.CharacterAdded:Connect(function()
     tool = nil;
 end);
 
-SG["success"]("Silent aim v3 loaded — head-only targeting + bullet impact tracer. Watch the cyan ball and F9 console for drift.");
+SG["success"]("Silent aim v4 loaded — head-only targeting + authoritative hit detector. Watch F9 for [yepper HIT] lines — that's ground truth, pred-error in studs.");
