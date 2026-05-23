@@ -443,7 +443,11 @@ end;
 -- head WAS at fire time (not where it is by the time HealthChanged arrives,
 -- which can be 50-200ms later).
 local shotHistory: {{t: number, pred: Vector3, targetHead: Vector3?, targetName: string?}} = {};
-local SHOT_WINDOW = 0.30;
+-- Wide enough to absorb 99th-percentile damage replication latency. Roblox
+-- shooters typically deliver HealthChanged 100-300ms after the Shoot call,
+-- but spikes to 400-500ms happen on bad routes — v5's 300ms window was
+-- misclassifying those as misses.
+local SHOT_WINDOW = 0.50;
 
 local oldShoot; oldShoot = clonefunction(hookfunction(rawget(wm, "Shoot"), newcclosure(function(...)
     lastFireAt = os.clock();
@@ -478,10 +482,14 @@ local function hookEnemyHumanoid(p: Player, char: Model)
         lastHP = newHP;
         if dmg <= 0 then return; end;
 
+        -- Match the OLDEST in-window shot at this player (FIFO). With burst
+        -- fire the oldest pending shot is the one whose damage event is most
+        -- likely arriving now; matching newest-first would credit the wrong
+        -- shot when damage events queue up, leaving real hits flagged as misses.
         local now = os.clock();
-        for i = #shotHistory, 1, -1 do
+        for i = 1, #shotHistory do
             local s = shotHistory[i];
-            if (now - s.t) > SHOT_WINDOW then break; end;
+            if (now - s.t) > SHOT_WINDOW then continue; end;
             if s.targetName == p.Name and s.targetHead then
                 local err = (s.pred - s.targetHead).Magnitude;
                 print(string.format(
@@ -515,7 +523,7 @@ end);
 -- Shots without a known target (no enemy near the prediction at fire time)
 -- are pruned silently — there's no meaningful "miss" if we weren't aimed
 -- at anyone in particular.
-local MISS_TIMEOUT = SHOT_WINDOW + 0.10;
+local MISS_TIMEOUT = SHOT_WINDOW + 0.05;
 RunService.Heartbeat:Connect(function()
     local now = os.clock();
     for i = #shotHistory, 1, -1 do
@@ -574,4 +582,4 @@ plr.CharacterAdded:Connect(function()
     tool = nil;
 end);
 
-SG["success"]("Silent aim v5 loaded — accel-aware lead + hit/miss detector. F9 shows [yepper HIT] and [yepper MISS] lines with pred-error in studs.");
+SG["success"]("Silent aim v5.1 loaded — accel-aware lead + hit/miss detector with widened correlation window. F9 shows [yepper HIT] and [yepper MISS] lines.");
