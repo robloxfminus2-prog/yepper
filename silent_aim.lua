@@ -118,6 +118,7 @@ loadstring(game:HttpGet("https://raw.githubusercontent.com/sneekygoober/sneeky-s
 local vel: number;
 local tool: Tool;
 local equippedData;  -- live ref to the WeaponModule data table for the current weapon
+local lastFireAt = 0;  -- timestamp of the last time WE actually pulled the trigger (wm.Shoot)
 
 --==[ Tunables ]==--
 local LEAD_MULTIPLIER = 1.0    -- 1.0 = pure lead. <1.0 if shots land AHEAD. >1.0 if shots land BEHIND.
@@ -266,14 +267,20 @@ local function findFirstBasePart(inst: Instance): BasePart?
 end;
 
 cp.ChildAdded:Connect(function(proj)
-    -- only track projectiles that spawned right after our hook returned a
-    -- prediction (i.e., bullets WE fired). 100ms window covers FE Gun Kit's
-    -- Crosshair -> projectile-spawn pipeline with margin.
-    if (os.clock() - lastPredictionAt) > 0.1 then return; end;
+    -- only track projectiles that spawned right after WE pulled the trigger.
+    -- (Crosshair fires every render frame for UI, so we can't gate on prediction
+    -- timestamps — gate on the actual Shoot call instead.)
+    if (os.clock() - lastFireAt) > 0.15 then return; end;
     local predictionAtFire = lastPrediction;
 
     local part = findFirstBasePart(proj);
     if not part then return; end;
+
+    -- proximity gate: our bullets spawn at our muzzle, never 100 studs away.
+    -- this filters enemy gunfire that lands in CosmeticProjectiles around us.
+    local myChar = plr.Character;
+    local myHead = myChar and myChar:FindFirstChild("Head");
+    if myHead and (part.Position - myHead.Position).Magnitude > 30 then return; end;
 
     local lastPos = part.Position;
     local conn;
@@ -358,6 +365,12 @@ for k, v in next, getfenv(anon) do
         end;
     end;
 end;
+
+--==[ Shoot hook — sets lastFireAt so the impact tracer only logs OUR shots ]==--
+local oldShoot; oldShoot = clonefunction(hookfunction(rawget(wm, "Shoot"), newcclosure(function(...)
+    lastFireAt = os.clock();
+    return oldShoot(...);
+end)));
 
 --==[ Equip hook ]==--
 local t: thread;
