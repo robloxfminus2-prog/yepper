@@ -86,8 +86,11 @@ local getTarget = function()
         local char = player.Character;
         if not char or char:FindFirstChildOfClass("ForceField") or (char:FindFirstChild("Humanoid") and char.Humanoid.Health <= 0) then continue; end;
 
-        local tPart: BasePart = char:FindFirstChild("Head") or char.PrimaryPart or char:FindFirstChild("HumanoidRootPart");
-        if not tPart then continue; end;
+        -- v3: skip half-formed characters (death anims, respawn race, headless custom models).
+        -- the game's own visualiseCharacter errors on these, and our shots register inconsistently.
+        local head = char:FindFirstChild("Head");
+        if not head then continue; end;
+        local tPart: BasePart = head;
 
         local pos, onScreen = cam:WorldToViewportPoint(tPart.Position);
         if not onScreen then continue; end;
@@ -229,6 +232,70 @@ RunService.RenderStepped:Connect(function()
     end;
 end);
 
+--==[ Bullet impact tracer (v3) ]==--
+-- Hooks CosmeticProjectiles. Every time a bullet WE fired finishes its flight
+-- (parent destroyed), pins a cyan ball at the last known position and prints
+-- the distance from that point to the prediction we returned for that shot.
+local impactMarker = Instance.new("Part");
+impactMarker.Name = "_aimImpact";
+impactMarker.Size = Vector3.new(0.75, 0.75, 0.75);
+impactMarker.Shape = Enum.PartType.Ball;
+impactMarker.Material = Enum.Material.Neon;
+impactMarker.Color = Color3.fromRGB(60, 200, 255);
+impactMarker.Transparency = 1;
+impactMarker.Anchored = true;
+impactMarker.CanCollide = false;
+impactMarker.CanQuery = false;
+impactMarker.CanTouch = false;
+impactMarker.CastShadow = false;
+impactMarker.Parent = workspace;
+
+local lastImpactAt = 0;
+
+RunService.RenderStepped:Connect(function()
+    if lastImpactAt > 0 and (os.clock() - lastImpactAt) < 3 then
+        impactMarker.Transparency = 0.2;
+    else
+        impactMarker.Transparency = 1;
+    end;
+end);
+
+local function findFirstBasePart(inst: Instance): BasePart?
+    if inst:IsA("BasePart") then return inst; end;
+    return inst:FindFirstChildWhichIsA("BasePart", true);
+end;
+
+cp.ChildAdded:Connect(function(proj)
+    -- only track projectiles that spawned right after our hook returned a
+    -- prediction (i.e., bullets WE fired). 100ms window covers FE Gun Kit's
+    -- Crosshair -> projectile-spawn pipeline with margin.
+    if (os.clock() - lastPredictionAt) > 0.1 then return; end;
+    local predictionAtFire = lastPrediction;
+
+    local part = findFirstBasePart(proj);
+    if not part then return; end;
+
+    local lastPos = part.Position;
+    local conn;
+    conn = RunService.Heartbeat:Connect(function()
+        if proj.Parent and part.Parent then
+            lastPos = part.Position;
+        else
+            conn:Disconnect();
+            impactMarker.CFrame = CFrame.new(lastPos);
+            lastImpactAt = os.clock();
+
+            if predictionAtFire then
+                local d = lastPos - predictionAtFire;
+                print(string.format(
+                    "[yepper] impact %.2f studs from prediction  (dx=%.2f dy=%.2f dz=%.2f)",
+                    d.Magnitude, d.X, d.Y, d.Z
+                ));
+            end;
+        end;
+    end);
+end);
+
 --==[ Crosshair / bulletMagnetism hooks ]==--
 for k, v in next, getfenv(anon) do
     if type(v) == "function" then
@@ -333,4 +400,4 @@ plr.CharacterAdded:Connect(function()
     tool = nil;
 end);
 
-SG["success"]("Silent aim loaded — spread/magnetism patched. Press F9 if shots still drift and screenshot the console.");
+SG["success"]("Silent aim v3 loaded — head-only targeting + bullet impact tracer. Watch the cyan ball and F9 console for drift.");
