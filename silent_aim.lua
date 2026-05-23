@@ -179,14 +179,34 @@ local function trackPosition(part: BasePart)
     end;
 end;
 
-local function getVelocity(part: BasePart): Vector3
+-- Returns (velocity, acceleration) for the given part, both in world frame.
+-- Velocity is averaged over the full window (smooth, the same low-noise
+-- estimate that gave us sub-stud pred-error on linear motion in v4).
+-- Acceleration is the difference between late-half and early-half mean
+-- velocity, divided by the time between window midpoints. Catches gravity
+-- on jumping targets (~ -196 studs/s² in y), and jump-impulse acceleration.
+local function getKinematics(part: BasePart): (Vector3, Vector3)
     local h = posHistory[part];
-    if not h or #h < 2 then return Vector3.zero; end;
+    if not h or #h < 2 then return Vector3.zero, Vector3.zero; end;
     local first = h[1];
     local last = h[#h];
     local dt = last.t - first.t;
-    if dt <= 0 then return Vector3.zero; end;
-    return (last.p - first.p) / dt;
+    if dt <= 0 then return Vector3.zero, Vector3.zero; end;
+    local v = (last.p - first.p) / dt;
+
+    if #h < 4 then return v, Vector3.zero; end;
+    local mid = math.floor(#h / 2);
+    local vEarly = (h[mid].p - h[1].p) / math.max(h[mid].t - h[1].t, 1e-6);
+    local vLate  = (h[#h].p - h[mid].p) / math.max(h[#h].t - h[mid].t, 1e-6);
+    local tEarlyMid = (h[1].t   + h[mid].t) / 2;
+    local tLateMid  = (h[mid].t + h[#h].t)  / 2;
+    if tLateMid - tEarlyMid <= 1e-6 then return v, Vector3.zero; end;
+    local accel = (vLate - vEarly) / (tLateMid - tEarlyMid);
+
+    -- Cap to discard replication-jitter spikes. Gravity is ~196, jump
+    -- impulses peak around 800-1200 over a frame. 1500 is generous ceiling.
+    if accel.Magnitude > 1500 then accel = accel.Unit * 1500; end;
+    return v, accel;
 end;
 
 RunService.Heartbeat:Connect(function()
@@ -233,8 +253,8 @@ RunService.RenderStepped:Connect(function()
     end;
 end);
 
---==[ Hit verification (v4) ]==--
--- Two signals now:
+--==[ Hit verification (v5) ]==--
+-- Three signals now:
 --   1. Cosmetic tracer (cyan ball) — kept for trajectory eyeballing. The LOG
 --      is gated so it only prints when the cosmetic dies NEAR an enemy body.
 --      Filters out cosmetics that punch into walls/skybox tens of studs past
@@ -242,6 +262,9 @@ end);
 --   2. Authoritative hit detector — listens to every enemy Humanoid for
 --      health drops within SHOT_WINDOW of OUR Shoot call. Ground truth.
 --      (Implemented below the Crosshair hook so it can use lastPrediction.)
+--   3. Miss detector — any shot whose SHOT_WINDOW closes without a matching
+--      HealthChanged is logged as [yepper MISS] with the same pred-error
+--      stats. v5 finally tracks both sides of the accuracy ledger.
 local impactMarker = Instance.new("Part");
 impactMarker.Name = "_aimImpact";
 impactMarker.Size = Vector3.new(0.75, 0.75, 0.75);
@@ -346,16 +369,19 @@ for k, v in next, getfenv(anon) do
                 local c = getTarget();
                 if c and vel and tool and plr.Character and plr.Character:FindFirstChild("Head") then
                     local pos = c.Position;
-                    local tVel = getVelocity(c);
+                    local tVel, tAcc = getKinematics(c);
 
                     local r = pos - plr.Character.Head.Position;
                     local v = tVel - plr.Character.Head.AssemblyLinearVelocity;
 
-                    local a = v:Dot(v) - vel * vel;
-                    local b = 2 * r:Dot(v);
-                    local c0 = r:Dot(r);
+                    -- Step 1: initial guess from constant-velocity quadratic
+                    -- (this is the v3/v4 solver, identical answer for any
+                    -- target whose acceleration is zero).
+                    local A = v:Dot(v) - vel * vel;
+                    local B = 2 * r:Dot(v);
+                    local C = r:Dot(r);
 
-                    local disc = b * b - 4 * a * c0;
+                    local disc = B * B - 4 * A * C;
                     if disc < 0 then
                         lastPrediction = pos;
                         lastPredictionAt = os.clock();
@@ -363,8 +389,8 @@ for k, v in next, getfenv(anon) do
                     end;
 
                     local sqrtDisc = math.sqrt(disc);
-                    local t1 = (-b - sqrtDisc) / (2 * a);
-                    local t2 = (-b + sqrtDisc) / (2 * a);
+                    local t1 = (-B - sqrtDisc) / (2 * A);
+                    local t2 = (-B + sqrtDisc) / (2 * A);
 
                     local t;
                     if t1 > 0 and t2 > 0 then
@@ -379,7 +405,18 @@ for k, v in next, getfenv(anon) do
                         return pos;
                     end;
 
-                    local prediction = pos + (tVel * t) * LEAD_MULTIPLIER;
+                    -- Step 2: Picard iteration to fold in the 0.5*a*t² term.
+                    -- Predict target's relative position at the current t
+                    -- estimate, then refine t = |relPos| / bulletSpeed.
+                    -- Converges in 2-3 passes for realistic accel magnitudes.
+                    for _ = 1, 4 do
+                        local relPos = r + v * t + 0.5 * tAcc * (t * t);
+                        local newT = relPos.Magnitude / vel;
+                        if math.abs(newT - t) < 0.005 then break; end;
+                        t = newT;
+                    end;
+
+                    local prediction = pos + (tVel * t + 0.5 * tAcc * (t * t)) * LEAD_MULTIPLIER;
 
                     lastPrediction = prediction;
                     lastPredictionAt = os.clock();
@@ -424,9 +461,8 @@ local oldShoot; oldShoot = clonefunction(hookfunction(rawget(wm, "Shoot"), newcc
             targetHead = headPos,
             targetName = who and who.Name or nil,
         });
-        while #shotHistory > 0 and (os.clock() - shotHistory[1].t) > 1 do
-            table.remove(shotHistory, 1);
-        end;
+        -- pruning happens in the miss-sweep heartbeat below; entries that
+        -- expire without a matching HealthChanged get logged as misses.
     end;
 
     return oldShoot(...);
@@ -472,6 +508,31 @@ Players.PlayerAdded:Connect(function(p)
     p.CharacterAdded:Connect(function(c) hookEnemyHumanoid(p, c); end);
 end);
 
+--==[ Miss detector ]==--
+-- Any shot that ages past MISS_TIMEOUT without a matching HealthChanged
+-- correlation is a miss. The 100ms grace over SHOT_WINDOW gives slow
+-- replication a chance to deliver the damage event before we judge.
+-- Shots without a known target (no enemy near the prediction at fire time)
+-- are pruned silently — there's no meaningful "miss" if we weren't aimed
+-- at anyone in particular.
+local MISS_TIMEOUT = SHOT_WINDOW + 0.10;
+RunService.Heartbeat:Connect(function()
+    local now = os.clock();
+    for i = #shotHistory, 1, -1 do
+        local s = shotHistory[i];
+        if (now - s.t) > MISS_TIMEOUT then
+            if s.targetName and s.targetHead then
+                local err = (s.pred - s.targetHead).Magnitude;
+                print(string.format(
+                    "[yepper MISS] aimed at %s  pred-error %.2f studs from head-at-fire  (no damage in %dms)",
+                    s.targetName, err, MISS_TIMEOUT * 1000
+                ));
+            end;
+            table.remove(shotHistory, i);
+        end;
+    end;
+end);
+
 --==[ Equip hook ]==--
 local t: thread;
 local old; old = clonefunction(hookfunction(rawget(wm, "Equip"), newcclosure(function(data, _)
@@ -513,4 +574,4 @@ plr.CharacterAdded:Connect(function()
     tool = nil;
 end);
 
-SG["success"]("Silent aim v4 loaded — head-only targeting + authoritative hit detector. Watch F9 for [yepper HIT] lines — that's ground truth, pred-error in studs.");
+SG["success"]("Silent aim v5 loaded — accel-aware lead + hit/miss detector. F9 shows [yepper HIT] and [yepper MISS] lines with pred-error in studs.");
